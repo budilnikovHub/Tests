@@ -1,0 +1,247 @@
+# Cuckoo CUDA test project
+
+This repository contains a minimal CUDA project that implements `siphash24`, `sipnode`, `sipedge` and a kernel that generates edges (u,v) from nonces. Use it to verify GPU outputs against your Java `siphash24` implementation.
+
+---
+
+## Files
+
+- CMakeLists.txt
+- src/main.cu
+- README.md
+
+---
+
+### CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.18)
+project(cuckoo_cuda LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 14)
+
+add_executable(cuckoo_cuda src/main.cu)
+
+# Optional: enable fast math if you want (not needed here)
+# target_compile_options(cuckoo_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>)
+
+# Set relocation to static runtime if needed
+if (MSVC)
+  set_target_properties(cuckoo_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+else()
+  set_target_properties(cuckoo_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# Link/compile options to suppress warnings on some systems
+if (NOT MSVC)
+  target_compile_options(cuckoo_cuda PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+```
+
+---
+
+### src/main.cu
+
+```cpp
+#include <cstdio>
+#include <cstdint>
+#include <vector>
+#include <cuda_runtime.h>
+
+// Device implementation of siphash24 (ported from Java code you provided)
+__device__ uint64_t siphash24_device(const uint64_t *k, uint64_t nonce) {
+    uint64_t v0 = k[0];
+    uint64_t v1 = k[1];
+    uint64_t v2 = k[2];
+    uint64_t v3 = k[3] ^ nonce;
+
+    // First 2-round sequence (unrolled as in Java)
+    v0 += v1;
+    v2 += v3;
+    v1 = (v1 << 13) | (v1 >> (64 - 13));
+    v3 = (v3 << 16) | (v3 >> (64 - 16));
+    v1 ^= v0;
+    v3 ^= v2;
+    v0 = (v0 << 32) | (v0 >> (64 - 32));
+    v2 += v1;
+    v0 += v3;
+    v1 = (v1 << 17) | (v1 >> (64 - 17));
+    v3 = (v3 << 21) | (v3 >> (64 - 21));
+    v1 ^= v2;
+    v3 ^= v0;
+    v2 = (v2 << 32) | (v2 >> (64 - 32));
+
+    // Repeat that sequence multiple times to match Java flow
+    v0 += v1;
+    v2 += v3;
+    v1 = (v1 << 13) | (v1 >> (64 - 13));
+    v3 = (v3 << 16) | (v3 >> (64 - 16));
+    v1 ^= v0;
+    v3 ^= v2;
+    v0 = (v0 << 32) | (v0 >> (64 - 32));
+    v2 += v1;
+    v0 += v3;
+    v1 = (v1 << 17) | (v1 >> (64 - 17));
+    v3 = (v3 << 21) | (v3 >> (64 - 21));
+    v1 ^= v2;
+    v3 ^= v0;
+    v2 = (v2 << 32) | (v2 >> (64 - 32));
+
+    // The Java implementation does several similar blocks; emulate the same structure
+    v0 ^= nonce;
+    v2 ^= 0xFFULL;
+
+    v0 += v1;
+    v2 += v3;
+    v1 = (v1 << 13) | (v1 >> (64 - 13));
+    v3 = (v3 << 16) | (v3 >> (64 - 16));
+    v1 ^= v0;
+    v3 ^= v2;
+    v0 = (v0 << 32) | (v0 >> (64 - 32));
+    v2 += v1;
+    v0 += v3;
+    v1 = (v1 << 17) | (v1 >> (64 - 17));
+    v3 = (v3 << 21) | (v3 >> (64 - 21));
+    v1 ^= v2;
+    v3 ^= v0;
+    v2 = (v2 << 32) | (v2 >> (64 - 32));
+
+    // Final mixing rounds (replicating the remainder of Java's routine)
+    v0 += v1;
+    v2 += v3;
+    v1 = (v1 << 13) | (v1 >> (64 - 13));
+    v3 = (v3 << 16) | (v3 >> (64 - 16));
+    v1 ^= v0;
+    v3 ^= v2;
+    v0 = (v0 << 32) | (v0 >> (64 - 32));
+    v2 += v1;
+    v0 += v3;
+    v1 = (v1 << 17) | (v1 >> (64 - 17));
+    v3 = (v3 << 21) | (v3 >> (64 - 21));
+    v1 ^= v2;
+    v3 ^= v0;
+    v2 = (v2 << 32) | (v2 >> (64 - 32));
+
+    v0 += v1;
+    v2 += v3;
+    v1 = (v1 << 13) | (v1 >> (64 - 13));
+    v3 = (v3 << 16) | (v3 >> (64 - 16));
+    v1 ^= v0;
+    v3 ^= v2;
+    v0 = (v0 << 32) | (v0 >> (64 - 32));
+    v2 += v1;
+    v0 += v3;
+    v1 = (v1 << 17) | (v1 >> (64 - 17));
+    v3 = (v3 << 21) | (v3 >> (64 - 21));
+    v1 ^= v2;
+    v3 ^= v0;
+    v2 = (v2 << 32) | (v2 >> (64 - 32));
+
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+__device__ inline uint32_t sipnode_device(const uint64_t *k, uint64_t nonce, int uorv) {
+    uint64_t h = siphash24_device(k, 2 * nonce + uorv);
+    return (uint32_t)(h & 0x7FFFFF); // 23 bits
+}
+
+__device__ inline void sipedge_device(const uint64_t *k, uint64_t nonce, uint32_t &u, uint32_t &v) {
+    u = sipnode_device(k, nonce, 0);
+    v = sipnode_device(k, nonce, 1);
+}
+
+// Kernel: each thread computes one edge (u,v) for nonce = start_nonce + idx
+__global__ void generate_edges_kernel(const uint64_t *d_k, uint64_t start_nonce,
+                                      uint32_t *d_u, uint32_t *d_v, uint64_t total) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    uint64_t nonce = start_nonce + idx;
+    uint32_t u, v;
+    sipedge_device(d_k, nonce, u, v);
+    d_u[idx] = u;
+    d_v[idx] = v;
+}
+
+int main(int argc, char** argv) {
+    uint64_t start_nonce = 0;
+    uint64_t total = 1 << 20; // default: generate 1M edges (adjust as needed)
+
+    if (argc >= 2) start_nonce = strtoull(argv[1], nullptr, 10);
+    if (argc >= 3) total = strtoull(argv[2], nullptr, 10);
+
+    // Example key (k[]) - replace with real keys from Java miner (k[0..3])
+    uint64_t h_k[4] = {0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL,
+                       0x1716151413121110ULL, 0x1f1e1d1c1b1a1918ULL};
+
+    uint64_t *d_k = nullptr;
+    uint32_t *d_u = nullptr;
+    uint32_t *d_v = nullptr;
+
+    cudaMalloc((void**)&d_k, 4 * sizeof(uint64_t));
+    cudaMemcpy(d_k, h_k, 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
+
+    cudaMalloc((void**)&d_u, total * sizeof(uint32_t));
+    cudaMalloc((void**)&d_v, total * sizeof(uint32_t));
+
+    const int TPB = 256;
+    int blocks = (int)((total + TPB - 1) / TPB);
+
+    generate_edges_kernel<<<blocks, TPB>>>(d_k, start_nonce, d_u, d_v, total);
+    cudaDeviceSynchronize();
+
+    // Copy back first N edges to inspect
+    size_t sample = 16;
+    if (sample > total) sample = (size_t)total;
+    std::vector<uint32_t> h_u(sample), h_v(sample);
+    cudaMemcpy(h_u.data(), d_u, sample * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_v.data(), d_v, sample * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+    printf("Generated edges (first %zu):\n", sample);
+    for (size_t i = 0; i < sample; ++i) {
+        printf("%6zu: %8u - %8u\n", i, h_u[i], h_v[i]);
+    }
+
+    cudaFree(d_k);
+    cudaFree(d_u);
+    cudaFree(d_v);
+    return 0;
+}
+```
+
+---
+
+### README.md
+
+```md
+# Cuckoo CUDA test
+
+Minimal project to test `siphash24` and edge generation on NVIDIA GPU.
+
+## Build
+
+```bash
+mkdir build && cd build
+cmake ..
+cmake --build . --config Release
+```
+
+Make sure CUDA toolkit is installed and `nvcc` available.
+
+## Run
+
+```bash
+./cuckoo_cuda [start_nonce] [total_edges]
+```
+
+Example (generate 1 million edges starting from nonce 0):
+
+```bash
+./cuckoo_cuda 0 1048576
+```
+
+## Next steps
+
+- Replace the example key `h_k` with the `k[0..3]` values used in your Java miner (extract them from the Java object that sets the key).\
+- Compare the first N `edges` printed by this program with the results from the Java `sipedge` for the same nonces to verify correctness.\
+- If outputs match, implement trimming / cycle-finding stages on GPU and integrate via JNI or by running this binary as an external process from Java.
